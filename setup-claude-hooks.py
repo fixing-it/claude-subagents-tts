@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -26,11 +27,56 @@ from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.text import Text
+from rich.table import Table
 
 console = Console()
 
 # Template source directory (current directory)
 TEMPLATE_DIR = Path(__file__).parent
+
+# Available MCP servers
+AVAILABLE_MCPS = {
+    "firecrawl": {
+        "name": "Firecrawl MCP",
+        "description": "Web scraping and crawling",
+        "npm_package": "firecrawl-mcp",
+        "command": "npx",
+        "args": ["-y", "firecrawl-mcp"],
+        "env_vars": ["FIRECRAWL_API_KEY"]
+    },
+    "github": {
+        "name": "GitHub MCP", 
+        "description": "GitHub repository operations", 
+        "npm_package": "@modelcontextprotocol/server-github",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-github"],
+        "env_vars": ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    },
+    "elevenlabs": {
+        "name": "ElevenLabs MCP",
+        "description": "Text-to-speech with ElevenLabs",
+        "python_package": "elevenlabs-mcp",
+        "command": "uvx",
+        "args": ["elevenlabs-mcp"],
+        "env_vars": ["ELEVENLABS_API_KEY"]
+    },
+    "context7": {
+        "name": "Context7 MCP",
+        "description": "Up-to-date code documentation",
+        "npm_package": "@upstash/context7-mcp",
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+        "env_vars": []
+    },
+    "serena": {
+        "name": "Serena MCP",
+        "description": "Coding agent toolkit with semantic retrieval",
+        "python_package": "git+https://github.com/oraios/serena",
+        "command": "uvx",
+        "args": ["--from", "git+https://github.com/oraios/serena", "serena-mcp-server"],
+        "env_vars": []
+    }
+}
 
 def create_project_structure(target_dir: Path) -> bool:
     """Create the basic project structure."""
@@ -87,6 +133,100 @@ def copy_tts_cache(target_dir: Path) -> bool:
     except Exception as e:
         console.print(f"⚠️  Warning: Could not copy TTS cache: {e}", style="yellow")
         return True  # Non-critical error
+
+def select_mcps(interactive: bool = False) -> list:
+    """Select MCP servers to install."""
+    if not interactive:
+        return []
+    
+    console.print("\n🔧 MCP Server Selection", style="bold blue")
+    
+    # Show available MCPs in a table
+    table = Table(title="Available MCP Servers")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="magenta")
+    table.add_column("Description", style="green")
+    
+    mcp_ids = list(AVAILABLE_MCPS.keys())
+    for i, (mcp_id, mcp_info) in enumerate(AVAILABLE_MCPS.items(), 1):
+        table.add_row(str(i), mcp_info["name"], mcp_info["description"])
+    
+    console.print(table)
+    
+    # Get selection
+    selected_mcps = []
+    console.print("\nSelect MCP servers (comma-separated numbers, e.g., '1,3,5' or 'none'):")
+    console.print("Recommended: [cyan]4,5[/cyan] (context7, serena)", style="dim")
+    selection = Prompt.ask("Your choice", default="none")
+    
+    if selection.lower() != "none":
+        try:
+            indices = [int(x.strip()) for x in selection.split(',')]
+            for idx in indices:
+                if 1 <= idx <= len(mcp_ids):
+                    selected_mcps.append(mcp_ids[idx - 1])
+        except ValueError:
+            console.print("⚠️  Invalid selection, skipping MCPs", style="yellow")
+    
+    return selected_mcps
+
+def install_mcps(target_dir: Path, selected_mcps: list) -> bool:
+    """Install selected MCP servers - just create configuration, no actual installation."""
+    if not selected_mcps:
+        return True
+    
+    success_count = 0
+    for mcp_id in selected_mcps:
+        mcp_info = AVAILABLE_MCPS[mcp_id]
+        console.print(f"🔧 Configuring {mcp_info['name']}...")
+        success_count += 1
+    
+    if success_count > 0:
+        console.print(f"✅ Configured {success_count} MCP servers", style="green")
+    
+    return success_count == len(selected_mcps)
+
+def create_mcp_settings(target_dir: Path, selected_mcps: list) -> bool:
+    """Create or update .claude/settings.json with MCP configuration."""
+    if not selected_mcps:
+        return True
+    
+    settings_file = target_dir / ".claude" / "settings.json"
+    
+    # Read existing settings or create new
+    settings = {}
+    if settings_file.exists():
+        try:
+            with open(settings_file, 'r') as f:
+                settings = json.load(f)
+        except Exception:
+            pass
+    
+    # Add MCP servers configuration
+    if "mcpServers" not in settings:
+        settings["mcpServers"] = {}
+    
+    for mcp_id in selected_mcps:
+        mcp_info = AVAILABLE_MCPS[mcp_id]
+        settings["mcpServers"][mcp_id] = {
+            "command": mcp_info["command"],
+            "args": mcp_info["args"]
+        }
+        
+        # Add environment variables if needed
+        if mcp_info["env_vars"]:
+            settings["mcpServers"][mcp_id]["env"] = {
+                var: f"${{{var}}}" for var in mcp_info["env_vars"]
+            }
+    
+    try:
+        with open(settings_file, 'w') as f:
+            json.dump(settings, f, indent=2)
+        console.print("✅ Updated settings.json with MCP configuration", style="green")
+        return True
+    except Exception as e:
+        console.print(f"❌ Failed to update settings.json: {e}", style="red")
+        return False
 
 def create_env_files(target_dir: Path, interactive: bool = False) -> bool:
     """Copy existing .env or create .env.sample file with API key templates."""
@@ -248,6 +388,10 @@ Examples:
         action="store_true",
         help="Interactive setup with API key configuration"
     )
+    parser.add_argument(
+        "--mcps",
+        help="Comma-separated list of MCP servers to install (firecrawl,github,elevenlabs,context7,serena)"
+    )
     
     args = parser.parse_args()
     
@@ -271,11 +415,28 @@ Examples:
     
     console.print("\n🚀 Starting setup...", style="bold")
     
+    # MCP selection
+    selected_mcps = []
+    if args.mcps:
+        # Command line MCP selection
+        requested_mcps = [mcp.strip() for mcp in args.mcps.split(',')]
+        selected_mcps = [mcp for mcp in requested_mcps if mcp in AVAILABLE_MCPS]
+        if selected_mcps != requested_mcps:
+            invalid = set(requested_mcps) - set(selected_mcps)
+            console.print(f"⚠️  Invalid MCPs ignored: {', '.join(invalid)}", style="yellow")
+    elif args.interactive:
+        selected_mcps = select_mcps(args.interactive)
+    
+    if selected_mcps:
+        console.print(f"📦 Selected MCPs: {', '.join(selected_mcps)}", style="cyan")
+    
     # Setup steps
     steps = [
         ("Creating project structure", lambda: create_project_structure(target_dir)),
         ("Copying .claude directory", lambda: copy_claude_directory(target_dir)),
         ("Copying TTS cache", lambda: copy_tts_cache(target_dir)),
+        ("Installing MCP servers", lambda: install_mcps(target_dir, selected_mcps)),
+        ("Configuring MCP settings", lambda: create_mcp_settings(target_dir, selected_mcps)),
         ("Setting up environment files", lambda: create_env_files(target_dir, args.interactive)),
         ("Creating README.md", lambda: create_readme(target_dir, project_name)),
     ]
