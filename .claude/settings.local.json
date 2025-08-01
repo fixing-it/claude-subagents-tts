@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "Bash(mv:*)",
+      "Bash(rmdir:*)",
+      "Bash(rm:*)",
+      "Bash(find:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(cp:*)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(echo $SHELL)",
+      "Bash(/bin/sh -c \"uv --version\")",
+      "Bash(for phrase in \"All done!\" \"Job complete!\" \"Ready for next task!\" \"Subagent complete!\" \"Setup completed successfully!\" \"Test passed!\" \"Build successful!\")",
+      "Bash(do echo \"Generating: $phrase\")",
+      "Bash(/dev/null)",
+      "Bash(done)",
+      "Bash(python3:*)"
+    ],
+    "deny": [],
+    "additionalDirectories": [
+      "/Users/alex/Coding/claude-code-hooks-mastery",
+      "/Users/alex/Coding"
+    ]
+  }
+}

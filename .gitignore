@@ -1,0 +1,102 @@
+# Environment and API Keys
+.env
+*.env
+!.env.sample
+
+# Audio files (pre-generated TTS cache should not be in repo)
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+output/tts-cache/
+
+# Session logs and temporary data
+logs/
+*.log
+*.jsonl
+
+# Claude Code personal configuration
+.claude/settings.json.backup
+.claude/projects/
+.claude/workspaces/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Testing and coverage
+.coverage
+.pytest_cache/
+.tox/
+htmlcov/
+
+# Node.js (if any JS components)
+node_modules/
+
+# UV cache
+.uv-cache/
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Personal notes and drafts
+notes/
+drafts/
+TODO.md
+NOTES.md
+
+# Test projects created by setup script
+*-test-project/
+*test-project/
+demo-project/
+cache-test-project/
+final-test-project/
+test-with-env-project/
+claude-hooks-demo-project/
+final-documentation-test/
