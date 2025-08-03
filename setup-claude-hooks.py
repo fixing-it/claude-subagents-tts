@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from rich.console import Console
@@ -77,6 +78,122 @@ AVAILABLE_MCPS = {
         "env_vars": []
     }
 }
+
+def check_node_version() -> tuple[bool, str]:
+    """Check if Node.js is available and meets minimum version requirements."""
+    try:
+        result = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True)
+        version_str = result.stdout.strip()
+        
+        # Parse version (e.g., "v18.17.0" -> [18, 17, 0])
+        if version_str.startswith('v'):
+            version_str = version_str[1:]
+        
+        version_parts = [int(x) for x in version_str.split('.')]
+        major_version = version_parts[0]
+        
+        # Node.js >= 18.0.0 required for context7
+        if major_version >= 18:
+            return True, version_str
+        else:
+            return False, version_str
+            
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return False, "not found"
+
+def install_mcp_dependencies(mcp_ids: list) -> bool:
+    """Install dependencies for the specified MCP servers."""
+    if not mcp_ids:
+        return True
+        
+    console.print("\n🔍 Checking and installing MCP dependencies...", style="blue")
+    
+    # Check Node.js requirements
+    node_ok, node_version = check_node_version()
+    needs_nodejs = any(mcp_id in ["context7", "firecrawl", "github"] for mcp_id in mcp_ids)
+    
+    if needs_nodejs and not node_ok:
+        if node_version == "not found":
+            console.print("❌ Node.js not found but required for selected MCPs", style="red")
+        else:
+            console.print(f"❌ Node.js v{node_version} found, but v18.0.0+ required for context7", style="red")
+        
+        console.print("Please install Node.js v18+:", style="yellow")
+        console.print("  - Download: https://nodejs.org/", style="dim")
+        console.print("  - Or use nvm: nvm install 18", style="dim")
+        return False
+    elif needs_nodejs:
+        console.print(f"✅ Node.js v{node_version} meets requirements", style="green")
+    
+    # Check other requirements
+    missing_commands = []
+    if needs_nodejs:
+        try:
+            subprocess.run(["npx", "--version"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            missing_commands.append("npx (should come with Node.js)")
+    
+    if any(mcp_id in ["elevenlabs", "serena"] for mcp_id in mcp_ids):
+        try:
+            subprocess.run(["uvx", "--help"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            missing_commands.append("uvx (uv)")
+    
+    if missing_commands:
+        console.print(f"❌ Missing required commands: {', '.join(missing_commands)}", style="red")
+        console.print("Installation guides:", style="yellow")
+        console.print("  - uv: https://docs.astral.sh/uv/", style="dim")
+        return False
+    
+    installed_count = 0
+    failed_count = 0
+    
+    for mcp_id in mcp_ids:
+        if mcp_id not in AVAILABLE_MCPS:
+            continue
+            
+        mcp_info = AVAILABLE_MCPS[mcp_id]
+        console.print(f"📦 Installing {mcp_info['name']}...", style="cyan")
+        
+        try:
+            if mcp_info["command"] == "npx":
+                # For npx packages, we don't need to pre-install
+                console.print(f"✅ {mcp_info['name']} ready (npx will download on demand)", style="green")
+                installed_count += 1
+            elif mcp_info["command"] == "uvx":
+                # For uvx packages, we can try to cache them
+                if "python_package" in mcp_info:
+                    package = mcp_info["python_package"]
+                    if package.startswith("git+"):
+                        # For git packages, try to install
+                        cmd = ["uvx", "--from", package, "--help"]
+                    else:
+                        cmd = ["uvx", package, "--help"]
+                    
+                    result = subprocess.run(cmd, capture_output=True, timeout=30)
+                    if result.returncode == 0:
+                        console.print(f"✅ {mcp_info['name']} installed successfully", style="green")
+                        installed_count += 1
+                    else:
+                        console.print(f"⚠️  {mcp_info['name']} may need manual setup", style="yellow")
+                        installed_count += 1  # Don't fail for this
+            else:
+                console.print(f"⚠️  Unknown command type for {mcp_info['name']}", style="yellow")
+                installed_count += 1  # Don't fail for this
+                
+        except subprocess.TimeoutExpired:
+            console.print(f"⚠️  {mcp_info['name']} installation timeout (will work on demand)", style="yellow")
+            installed_count += 1
+        except Exception as e:
+            console.print(f"❌ Failed to install {mcp_info['name']}: {e}", style="red")
+            failed_count += 1
+    
+    if failed_count == 0:
+        console.print(f"🎉 All {installed_count} MCP dependencies ready!", style="bold green")
+        return True
+    else:
+        console.print(f"⚠️  {installed_count} succeeded, {failed_count} failed", style="yellow")
+        return installed_count > 0
 
 def create_project_structure(target_dir: Path) -> bool:
     """Create the basic project structure."""
@@ -171,61 +288,47 @@ def select_mcps(interactive: bool = False) -> list:
     return selected_mcps
 
 def install_mcps(target_dir: Path, selected_mcps: list) -> bool:
-    """Install selected MCP servers - just create configuration, no actual installation."""
+    """Install selected MCP servers and their dependencies."""
     if not selected_mcps:
         return True
     
-    success_count = 0
-    for mcp_id in selected_mcps:
-        mcp_info = AVAILABLE_MCPS[mcp_id]
-        console.print(f"🔧 Configuring {mcp_info['name']}...")
-        success_count += 1
+    # Install dependencies first
+    if not install_mcp_dependencies(selected_mcps):
+        console.print("⚠️  Some dependencies failed to install, but continuing with configuration...", style="yellow")
     
-    if success_count > 0:
-        console.print(f"✅ Configured {success_count} MCP servers", style="green")
-    
-    return success_count == len(selected_mcps)
+    console.print(f"✅ Configured {len(selected_mcps)} MCP servers", style="green")
+    return True
 
-def create_mcp_settings(target_dir: Path, selected_mcps: list) -> bool:
-    """Create or update .claude/settings.json with MCP configuration."""
+def create_mcp_config(target_dir: Path, selected_mcps: list) -> bool:
+    """Create .mcp.json with MCP configuration."""
     if not selected_mcps:
         return True
     
-    settings_file = target_dir / ".claude" / "settings.json"
+    mcp_file = target_dir / ".mcp.json"
     
-    # Read existing settings or create new
-    settings = {}
-    if settings_file.exists():
-        try:
-            with open(settings_file, 'r') as f:
-                settings = json.load(f)
-        except Exception:
-            pass
-    
-    # Add MCP servers configuration
-    if "mcpServers" not in settings:
-        settings["mcpServers"] = {}
+    # Create MCP configuration
+    config = {"mcpServers": {}}
     
     for mcp_id in selected_mcps:
         mcp_info = AVAILABLE_MCPS[mcp_id]
-        settings["mcpServers"][mcp_id] = {
+        config["mcpServers"][mcp_id] = {
             "command": mcp_info["command"],
             "args": mcp_info["args"]
         }
         
         # Add environment variables if needed
         if mcp_info["env_vars"]:
-            settings["mcpServers"][mcp_id]["env"] = {
+            config["mcpServers"][mcp_id]["env"] = {
                 var: f"${{{var}}}" for var in mcp_info["env_vars"]
             }
     
     try:
-        with open(settings_file, 'w') as f:
-            json.dump(settings, f, indent=2)
-        console.print("✅ Updated settings.json with MCP configuration", style="green")
+        with open(mcp_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        console.print("✅ Created .mcp.json with MCP configuration", style="green")
         return True
     except Exception as e:
-        console.print(f"❌ Failed to update settings.json: {e}", style="red")
+        console.print(f"❌ Failed to create .mcp.json: {e}", style="red")
         return False
 
 def create_env_files(target_dir: Path, interactive: bool = False) -> bool:
@@ -304,7 +407,12 @@ cp .env.sample .env
 # Mindestens ELEVENLABS_API_KEY für TTS Features
 ```
 
-### 2. Testen
+### 2. Hook-Pfade konfigurieren
+```bash
+/setup-hooks          # Konfiguriert alle Hook-Pfade automatisch
+```
+
+### 3. Testen
 ```bash
 hi claude              # Greeting Agent
 tts summary           # TTS Summary Agent  
@@ -436,7 +544,7 @@ Examples:
         ("Copying .claude directory", lambda: copy_claude_directory(target_dir)),
         ("Copying TTS cache", lambda: copy_tts_cache(target_dir)),
         ("Installing MCP servers", lambda: install_mcps(target_dir, selected_mcps)),
-        ("Configuring MCP settings", lambda: create_mcp_settings(target_dir, selected_mcps)),
+        ("Creating MCP configuration", lambda: create_mcp_config(target_dir, selected_mcps)),
         ("Setting up environment files", lambda: create_env_files(target_dir, args.interactive)),
         ("Creating README.md", lambda: create_readme(target_dir, project_name)),
     ]
@@ -458,7 +566,8 @@ Examples:
         console.print("1. cd " + str(target_dir))
         console.print("2. cp .env.sample .env")
         console.print("3. Edit .env with your API keys")
-        console.print("4. Test with: hi claude")
+        console.print("4. Run /setup-hooks to configure hook paths")
+        console.print("5. Test with: hi claude")
     else:
         console.print(f"⚠️  Setup completed with {len(steps) - success_count} errors", style="yellow")
         sys.exit(1)

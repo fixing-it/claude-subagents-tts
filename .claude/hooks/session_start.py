@@ -76,6 +76,24 @@ def get_git_status():
         return None, None
 
 
+def save_project_root():
+    """Save the current project root path for other hooks to use."""
+    try:
+        project_root = Path.cwd().resolve()
+        project_root_file = Path('.claude') / 'project_root.json'
+        
+        # Ensure .claude directory exists
+        project_root_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save project root path
+        with open(project_root_file, 'w') as f:
+            json.dump({"project_root": str(project_root)}, f, indent=2)
+            
+    except Exception:
+        # Fail silently if we can't save project root
+        pass
+
+
 def get_recent_issues():
     """Get recent GitHub issues if gh CLI is available."""
     try:
@@ -160,6 +178,9 @@ def main():
         
         # Log the session start event
         log_session_start(input_data)
+        
+        # Save current project root for other hooks to use
+        save_project_root()
         
         # Load development context if requested
         if args.load_context:

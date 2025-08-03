@@ -17,7 +17,11 @@
       "Bash(do echo \"Generating: $phrase\")",
       "Bash(/dev/null)",
       "Bash(done)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git remote add:*)"
     ],
     "deny": [],
     "additionalDirectories": [

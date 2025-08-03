@@ -23,7 +23,10 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
+import termios
+import tty
 from pathlib import Path
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
@@ -76,51 +79,227 @@ AVAILABLE_MCPS = {
     }
 }
 
-def find_claude_settings(project_dir: Path = None) -> Path:
-    """Find .claude/settings.json in specified directory or current directory."""
+def find_mcp_config(project_dir: Path = None) -> Path:
+    """Find .mcp.json in specified directory or current directory."""
     if project_dir is None:
         project_dir = Path.cwd()
     else:
         project_dir = Path(project_dir).resolve()
     
-    settings_file = project_dir / ".claude" / "settings.json"
-    if settings_file.exists():
-        return settings_file
+    mcp_file = project_dir / ".mcp.json"
+    if mcp_file.exists():
+        return mcp_file
     
-    raise FileNotFoundError(f"No .claude/settings.json found in {project_dir}")
+    raise FileNotFoundError(f"No .mcp.json found in {project_dir}")
 
 # Global variable to store project directory
 PROJECT_DIR = None
 
-def load_current_settings() -> dict:
-    """Load current Claude settings."""
+def check_command_available(command: str) -> bool:
+    """Check if a command is available in PATH."""
     try:
-        settings_file = find_claude_settings(PROJECT_DIR)
-        with open(settings_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError as e:
-        console.print(f"❌ {e}", style="red")
-        console.print("Make sure you're in a Claude Code project directory or specify --project path", style="yellow")
-        sys.exit(1)
+        subprocess.run([command, "--version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def check_node_version() -> tuple[bool, str]:
+    """Check if Node.js is available and meets minimum version requirements."""
+    try:
+        result = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True)
+        version_str = result.stdout.strip()
+        
+        # Parse version (e.g., "v18.17.0" -> [18, 17, 0])
+        if version_str.startswith('v'):
+            version_str = version_str[1:]
+        
+        version_parts = [int(x) for x in version_str.split('.')]
+        major_version = version_parts[0]
+        
+        # Node.js >= 18.0.0 required for context7
+        if major_version >= 18:
+            return True, version_str
+        else:
+            return False, version_str
+            
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return False, "not found"
+
+def check_npm_package_installed(package: str) -> bool:
+    """Check if an npm package is globally installed."""
+    try:
+        result = subprocess.run(
+            ["npm", "list", "-g", "--depth=0", package],
+            capture_output=True,
+            text=True
+        )
+        return package in result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def check_python_package_available(package: str) -> bool:
+    """Check if a Python package is available via uvx."""
+    if package.startswith("git+"):
+        # For git packages, we can't easily check availability
+        return True
+    try:
+        # Try to get help from uvx - if package exists, this should work
+        result = subprocess.run(
+            ["uvx", "--help"],
+            capture_output=True
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def install_mcp_dependencies(mcp_ids: list) -> bool:
+    """Install dependencies for the specified MCP servers."""
+    console.print("\n🔍 Checking and installing MCP dependencies...", style="blue")
+    
+    # Check Node.js requirements
+    node_ok, node_version = check_node_version()
+    needs_nodejs = any(mcp_id in ["context7", "firecrawl", "github"] for mcp_id in mcp_ids)
+    
+    if needs_nodejs and not node_ok:
+        if node_version == "not found":
+            console.print("❌ Node.js not found but required for selected MCPs", style="red")
+        else:
+            console.print(f"❌ Node.js v{node_version} found, but v18.0.0+ required for context7", style="red")
+        
+        console.print("Please install Node.js v18+:", style="yellow")
+        console.print("  - Download: https://nodejs.org/", style="dim")
+        console.print("  - Or use nvm: nvm install 18", style="dim")
+        return False
+    elif needs_nodejs:
+        console.print(f"✅ Node.js v{node_version} meets requirements", style="green")
+    
+    # Check other basic requirements
+    missing_commands = []
+    if needs_nodejs and not check_command_available("npx"):
+        missing_commands.append("npx (should come with Node.js)")
+    if any(mcp_id in ["elevenlabs", "serena"] for mcp_id in mcp_ids) and not check_command_available("uvx"):
+        missing_commands.append("uvx (uv)")
+    
+    if missing_commands:
+        console.print(f"❌ Missing required commands: {', '.join(missing_commands)}", style="red")
+        console.print("Installation guides:", style="yellow")
+        console.print("  - uv: https://docs.astral.sh/uv/", style="dim")
+        return False
+    
+    installed_count = 0
+    failed_count = 0
+    
+    for mcp_id in mcp_ids:
+        if mcp_id not in AVAILABLE_MCPS:
+            continue
+            
+        mcp_info = AVAILABLE_MCPS[mcp_id]
+        console.print(f"📦 Installing {mcp_info['name']}...", style="cyan")
+        
+        try:
+            if mcp_info["command"] == "npx":
+                # Test npx with a simple command to check for permission issues
+                test_result = subprocess.run(
+                    ["npx", "--version"], 
+                    capture_output=True, 
+                    text=True,
+                    timeout=10
+                )
+                if test_result.returncode == 0:
+                    console.print(f"✅ {mcp_info['name']} ready (npx will download on demand)", style="green")
+                    installed_count += 1
+                else:
+                    console.print(f"⚠️  {mcp_info['name']} may have npm cache issues", style="yellow")
+                    console.print("  Try: npm cache clean --force", style="dim")
+                    installed_count += 1  # Don't fail the whole process
+            elif mcp_info["command"] == "uvx":
+                # For uvx packages, we can try to cache them
+                if "python_package" in mcp_info:
+                    package = mcp_info["python_package"]
+                    if package.startswith("git+"):
+                        # For git packages, try to install
+                        cmd = ["uvx", "--from", package, "--help"]
+                    else:
+                        cmd = ["uvx", package, "--help"]
+                    
+                    result = subprocess.run(cmd, capture_output=True, timeout=30)
+                    if result.returncode == 0:
+                        console.print(f"✅ {mcp_info['name']} installed successfully", style="green")
+                        installed_count += 1
+                    else:
+                        console.print(f"⚠️  {mcp_info['name']} may need manual setup", style="yellow")
+                        installed_count += 1  # Don't fail for this
+            else:
+                console.print(f"⚠️  Unknown command type for {mcp_info['name']}", style="yellow")
+                installed_count += 1  # Don't fail for this
+                
+        except subprocess.TimeoutExpired:
+            console.print(f"⚠️  {mcp_info['name']} installation timeout (will work on demand)", style="yellow")
+            installed_count += 1
+        except Exception as e:
+            console.print(f"❌ Failed to install {mcp_info['name']}: {e}", style="red")
+            failed_count += 1
+    
+    if failed_count == 0:
+        console.print(f"🎉 All {installed_count} MCP dependencies ready!", style="bold green")
+        return True
+    else:
+        console.print(f"⚠️  {installed_count} succeeded, {failed_count} failed", style="yellow")
+        console.print("\n💡 If you're having npm issues, try:", style="blue")
+        console.print("   npm cache clean --force", style="dim")
+        console.print("   sudo chown -R $(whoami) ~/.npm", style="dim")
+        return installed_count > 0
+
+def fix_npm_cache():
+    """Try to fix common npm cache permission issues."""
+    console.print("🔧 Attempting to fix npm cache issues...", style="blue")
+    
+    try:
+        # Clean npm cache
+        result = subprocess.run(["npm", "cache", "clean", "--force"], 
+                              capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            console.print("✅ npm cache cleaned", style="green")
+        else:
+            console.print("⚠️  npm cache clean failed", style="yellow")
+        
+        # Try to fix permissions (this might need sudo)
+        console.print("💡 You may need to run: sudo chown -R $(whoami) ~/.npm", style="yellow")
+        return True
+        
     except Exception as e:
-        console.print(f"❌ Error reading settings: {e}", style="red")
+        console.print(f"❌ Cache fix failed: {e}", style="red")
+        return False
+
+def load_mcp_config() -> dict:
+    """Load current MCP configuration."""
+    try:
+        mcp_file = find_mcp_config(PROJECT_DIR)
+        with open(mcp_file, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        # Create empty config if file doesn't exist
+        return {"mcpServers": {}}
+    except Exception as e:
+        console.print(f"❌ Error reading .mcp.json: {e}", style="red")
         sys.exit(1)
 
-def save_settings(settings: dict) -> bool:
-    """Save settings back to file."""
+def save_mcp_config(config: dict) -> bool:
+    """Save MCP configuration back to file."""
     try:
-        settings_file = find_claude_settings(PROJECT_DIR)
-        with open(settings_file, 'w') as f:
-            json.dump(settings, f, indent=2)
+        project_dir = PROJECT_DIR or Path.cwd()
+        mcp_file = project_dir / ".mcp.json"
+        with open(mcp_file, 'w') as f:
+            json.dump(config, f, indent=2)
         return True
     except Exception as e:
-        console.print(f"❌ Error saving settings: {e}", style="red")
+        console.print(f"❌ Error saving .mcp.json: {e}", style="red")
         return False
 
 def list_current_mcps():
     """List currently installed MCP servers."""
-    settings = load_current_settings()
-    mcps = settings.get("mcpServers", {})
+    config = load_mcp_config()
+    mcps = config.get("mcpServers", {})
     
     if not mcps:
         console.print("📦 No MCP servers configured", style="yellow")
@@ -145,44 +324,68 @@ def list_current_mcps():
     
     console.print(table)
 
-def add_mcps(mcp_ids: list):
+def add_mcps(mcp_ids: list, install_deps: bool = True):
     """Add MCP servers to configuration."""
-    settings = load_current_settings()
+    config = load_mcp_config()
     
-    if "mcpServers" not in settings:
-        settings["mcpServers"] = {}
+    if "mcpServers" not in config:
+        config["mcpServers"] = {}
     
-    added = []
+    # Filter out already configured MCPs
+    to_add = []
     for mcp_id in mcp_ids:
         if mcp_id not in AVAILABLE_MCPS:
             console.print(f"⚠️  Unknown MCP: {mcp_id}", style="yellow")
             continue
         
-        if mcp_id in settings["mcpServers"]:
+        if mcp_id in config["mcpServers"]:
             console.print(f"⚠️  {mcp_id} already configured", style="yellow")
             continue
         
+        to_add.append(mcp_id)
+    
+    if not to_add:
+        return
+    
+    # Install dependencies first if requested
+    if install_deps:
+        if not install_mcp_dependencies(to_add):
+            console.print("⚠️  Some dependencies failed to install, but continuing with configuration...", style="yellow")
+    
+    # Add to configuration
+    added = []
+    for mcp_id in to_add:
         mcp_info = AVAILABLE_MCPS[mcp_id]
-        settings["mcpServers"][mcp_id] = {
+        config["mcpServers"][mcp_id] = {
             "command": mcp_info["command"],
             "args": mcp_info["args"]
         }
         
         if mcp_info["env_vars"]:
-            settings["mcpServers"][mcp_id]["env"] = {
+            config["mcpServers"][mcp_id]["env"] = {
                 var: f"${{{var}}}" for var in mcp_info["env_vars"]
             }
         
         added.append(mcp_id)
-        console.print(f"✅ Added {mcp_info['name']}", style="green")
+        console.print(f"✅ Configured {mcp_info['name']}", style="green")
     
-    if added and save_settings(settings):
-        console.print(f"🎉 Successfully added {len(added)} MCP servers", style="bold green")
+    if added and save_mcp_config(config):
+        console.print(f"🎉 Successfully configured {len(added)} MCP servers", style="bold green")
+        
+        # Show environment variable reminder
+        env_vars_needed = []
+        for mcp_id in added:
+            env_vars_needed.extend(AVAILABLE_MCPS[mcp_id]["env_vars"])
+        
+        if env_vars_needed:
+            console.print(f"\n💡 Don't forget to set these environment variables:", style="blue")
+            for var in sorted(set(env_vars_needed)):
+                console.print(f"   {var}", style="cyan")
 
 def remove_mcps(mcp_ids: list):
     """Remove MCP servers from configuration."""
-    settings = load_current_settings()
-    mcps = settings.get("mcpServers", {})
+    config = load_mcp_config()
+    mcps = config.get("mcpServers", {})
     
     removed = []
     for mcp_id in mcp_ids:
@@ -193,13 +396,13 @@ def remove_mcps(mcp_ids: list):
         else:
             console.print(f"⚠️  {mcp_id} not found", style="yellow")
     
-    if removed and save_settings(settings):
+    if removed and save_mcp_config(config):
         console.print(f"🎉 Successfully removed {len(removed)} MCP servers", style="bold green")
 
 def update_mcps():
     """Update existing MCP configurations to latest format."""
-    settings = load_current_settings()
-    mcps = settings.get("mcpServers", {})
+    config = load_mcp_config()
+    mcps = config.get("mcpServers", {})
     
     updated = []
     for mcp_id, config in mcps.items():
@@ -222,105 +425,185 @@ def update_mcps():
                 updated.append(mcp_id)
                 console.print(f"✅ Updated {new_config['name']}", style="green")
     
-    if updated and save_settings(settings):
+    if updated and save_mcp_config(config):
         console.print(f"🎉 Successfully updated {len(updated)} MCP servers", style="bold green")
     elif not updated:
         console.print("✅ All MCP servers are up to date", style="green")
 
+def get_key():
+    """Get a single keypress from stdin using termios."""
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        
+        # Create new settings for raw mode
+        new_settings = old_settings.copy()
+        new_settings[3] = new_settings[3] & ~(termios.ICANON | termios.ECHO)
+        new_settings[6][termios.VMIN] = 1
+        new_settings[6][termios.VTIME] = 0
+        
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
+            char = sys.stdin.read(1)
+            
+            # Handle escape sequences (arrow keys)
+            if char == '\x1b':
+                char += sys.stdin.read(2)
+                
+            return char
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            
+    except (ImportError, AttributeError, OSError, termios.error):
+        # Terminal doesn't support raw mode
+        raise Exception("Terminal input not supported")
+
 def interactive_mcp_selection():
-    """Interactive MCP selection with checkboxes."""
-    settings = load_current_settings()
-    current_mcps = set(settings.get("mcpServers", {}).keys())
+    """Interactive MCP selection with arrow keys and spacebar."""
+    config = load_mcp_config()
+    current_mcps = set(config.get("mcpServers", {}).keys())
     
-    console.print(Panel.fit("MCP Server Selection", style="blue"))
+    # Available MCPs with current selection
+    mcps = list(AVAILABLE_MCPS.items())
+    selected = current_mcps.copy()
+    cursor = 0
     
-    # Show current status
-    console.print("\n📦 Current Status:")
-    if current_mcps:
-        console.print(f"Installed: {', '.join(sorted(current_mcps))}", style="green")
-    else:
-        console.print("No MCP servers installed", style="yellow")
-    
-    # Show available options with current status
-    console.print("\n🔧 Available MCP Servers:")
-    table = Table()
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Status", style="white", no_wrap=True) 
-    table.add_column("Name", style="magenta")
-    table.add_column("Description", style="green")
-    
-    available_ids = list(AVAILABLE_MCPS.keys())
-    for i, (mcp_id, mcp_info) in enumerate(AVAILABLE_MCPS.items(), 1):
-        status = "✅ Installed" if mcp_id in current_mcps else "⬜ Available"
-        table.add_row(str(i), status, mcp_info["name"], mcp_info["description"])
-    
-    console.print(table)
-    
-    # Get selection
-    console.print("\n📝 Selection Options:")
-    console.print("• Enter numbers to toggle (e.g., '1,3,5')")
-    console.print("• Enter 'all' to install all")
-    console.print("• Enter 'none' to remove all")
-    console.print("• Enter 'done' to finish")
-    
-    selected_mcps = current_mcps.copy()
-    
-    while True:
-        current_status = ", ".join(sorted(selected_mcps)) if selected_mcps else "none"
-        console.print(f"\n🎯 Currently selected: {current_status}", style="cyan")
+    def render_menu():
+        console.clear()
+        console.print(Panel.fit("MCP Server Selection - Use ↑↓ arrows, SPACE to toggle, ENTER to finish", style="blue"))
+        console.print()
         
-        selection = Prompt.ask("Your choice", default="done")
+        for i, (mcp_id, mcp_info) in enumerate(mcps):
+            # Cursor indicator
+            cursor_mark = "→ " if i == cursor else "  "
+            
+            # Checkbox with color coding
+            if mcp_id in selected:
+                checkbox = "[bold green]✓[/bold green]"
+                name_style = "bold green"
+                bg_style = "on bright_black" if i == cursor else ""
+            else:
+                checkbox = "[dim]☐[/dim]"
+                name_style = "white"
+                bg_style = "on bright_black" if i == cursor else ""
+            
+            # Highlight current row
+            line = f"{cursor_mark}{checkbox} [{name_style}]{mcp_info['name']}[/{name_style}] - {mcp_info['description']}"
+            if i == cursor:
+                console.print(f"[{bg_style}]{line}[/{bg_style}]")
+            else:
+                console.print(line)
         
-        if selection.lower() == "done":
-            break
-        elif selection.lower() == "all":
-            selected_mcps = set(AVAILABLE_MCPS.keys())
-            console.print("✅ Selected all MCP servers", style="green")
-        elif selection.lower() == "none":
-            selected_mcps = set()
-            console.print("✅ Deselected all MCP servers", style="green")
-        else:
-            # Parse numbers/IDs
+        console.print(f"\n[bold cyan]Selected: {len(selected)} MCPs[/bold cyan]")
+        console.print("\n[dim]Controls:[/dim]")
+        console.print("[dim]↑↓  Navigate  │  SPACE  Toggle  │  ENTER  Finish  │  ESC  Cancel[/dim]")
+    
+    # Main interaction loop
+    try:
+        while True:
+            render_menu()
+            
             try:
-                selections = [s.strip() for s in selection.split(',')]
-                for sel in selections:
-                    if sel.isdigit():
-                        idx = int(sel) - 1
-                        if 0 <= idx < len(available_ids):
-                            mcp_id = available_ids[idx]
-                            if mcp_id in selected_mcps:
-                                selected_mcps.remove(mcp_id)
-                                console.print(f"➖ Deselected {AVAILABLE_MCPS[mcp_id]['name']}", style="yellow")
-                            else:
-                                selected_mcps.add(mcp_id)
-                                console.print(f"➕ Selected {AVAILABLE_MCPS[mcp_id]['name']}", style="green")
-                    elif sel in AVAILABLE_MCPS:
-                        mcp_id = sel
-                        if mcp_id in selected_mcps:
-                            selected_mcps.remove(mcp_id)
-                            console.print(f"➖ Deselected {AVAILABLE_MCPS[mcp_id]['name']}", style="yellow")
-                        else:
-                            selected_mcps.add(mcp_id)
-                            console.print(f"➕ Selected {AVAILABLE_MCPS[mcp_id]['name']}", style="green")
-            except (ValueError, IndexError):
-                console.print("⚠️  Invalid selection, try again", style="yellow")
+                key = get_key()
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Cancelled[/yellow]")
+                return
+            
+            if key == '\x1b[A':  # Up arrow
+                cursor = (cursor - 1) % len(mcps)
+            elif key == '\x1b[B':  # Down arrow  
+                cursor = (cursor + 1) % len(mcps)
+            elif key == ' ':  # Space - toggle
+                mcp_id = mcps[cursor][0]
+                if mcp_id in selected:
+                    selected.remove(mcp_id)
+                else:
+                    selected.add(mcp_id)
+            elif key == '\r' or key == '\n':  # Enter - finish
+                break
+            elif key == '\x1b':  # ESC - cancel
+                console.print("\n[yellow]Cancelled[/yellow]")
+                return
+            elif key == 'q':  # q - quit
+                console.print("\n[yellow]Cancelled[/yellow]")
+                return
+    
+    except Exception as e:
+        console.print(f"\n[red]Error during interaction: {e}[/red]")
+        console.print("[yellow]Falling back to text input...[/yellow]")
+        # Fallback to simple text input
+        return interactive_mcp_selection_fallback(config, current_mcps)
     
     # Apply changes
-    if selected_mcps != current_mcps:
-        to_add = selected_mcps - current_mcps
-        to_remove = current_mcps - selected_mcps
+    if selected != current_mcps:
+        to_add = selected - current_mcps
+        to_remove = current_mcps - selected
+        
+        console.clear()
+        console.print("🔄 Applying changes...\n")
         
         if to_remove:
-            console.print(f"\n🗑️  Removing: {', '.join(sorted(to_remove))}")
+            console.print(f"[yellow]🗑️  Removing: {', '.join(sorted(to_remove))}[/yellow]")
             remove_mcps(list(to_remove))
         
         if to_add:
-            console.print(f"\n📦 Adding: {', '.join(sorted(to_add))}")
+            console.print(f"[cyan]📦 Adding: {', '.join(sorted(to_add))}[/cyan]")
             add_mcps(list(to_add))
         
         console.print("\n🎉 MCP configuration updated!", style="bold green")
     else:
-        console.print("\n✅ No changes made", style="green")
+        console.clear()
+        console.print("✅ No changes made", style="green")
+
+def interactive_mcp_selection_fallback(config, current_mcps):
+    """Fallback text-based selection if arrow keys don't work."""
+    mcps = list(AVAILABLE_MCPS.items())
+    selected = current_mcps.copy()
+    
+    console.print("\n🔧 MCP Server Configuration (Text Mode):\n")
+    
+    for i, (mcp_id, mcp_info) in enumerate(mcps, 1):
+        status = "✓" if mcp_id in selected else "☐"
+        console.print(f"{i}. {status} {mcp_info['name']} ({mcp_id}) - {mcp_info['description']}")
+    
+    console.print(f"\n[bold cyan]Selected: {len(selected)} MCPs[/bold cyan]")
+    console.print("\n[dim]Enter numbers to toggle (e.g., '1,3'), 'all', 'none', or 'done':[/dim]")
+    
+    while True:
+        choice = Prompt.ask("Your choice", default="done").lower().strip()
+        
+        if choice == "done":
+            break
+        elif choice == "all":
+            selected = set(AVAILABLE_MCPS.keys())
+            console.print("✅ Selected all")
+        elif choice == "none":
+            selected = set()
+            console.print("✅ Deselected all")
+        else:
+            try:
+                numbers = [int(x.strip()) for x in choice.split(',')]
+                for num in numbers:
+                    if 1 <= num <= len(mcps):
+                        mcp_id = mcps[num-1][0]
+                        if mcp_id in selected:
+                            selected.remove(mcp_id)
+                        else:
+                            selected.add(mcp_id)
+            except ValueError:
+                console.print("[red]Invalid input[/red]")
+    
+    # Apply changes same as main function
+    if selected != current_mcps:
+        to_add = selected - current_mcps
+        to_remove = current_mcps - selected
+        
+        if to_remove:
+            remove_mcps(list(to_remove))
+        if to_add:
+            add_mcps(list(to_add))
+        
+        console.print("\n🎉 Updated!", style="bold green")
 
 def interactive_management():
     """Interactive MCP management."""
@@ -332,9 +615,10 @@ def interactive_management():
         console.print("1. Configure MCP servers (interactive selection)")
         console.print("2. List current MCPs")
         console.print("3. Update MCP configurations to latest")
-        console.print("4. Exit")
+        console.print("4. Fix npm cache issues")
+        console.print("5. Exit")
         
-        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4"], default="4")
+        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5"], default="5")
         
         if choice == "1":
             interactive_mcp_selection()
@@ -343,6 +627,8 @@ def interactive_management():
         elif choice == "3":
             update_mcps()
         elif choice == "4":
+            fix_npm_cache()
+        elif choice == "5":
             break
 
 def main():
